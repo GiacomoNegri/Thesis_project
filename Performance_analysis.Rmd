@@ -1,0 +1,1582 @@
+---
+title: "231121_R2"
+author: "Giacomo Negri"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r,message=FALSE}
+require(dplyr)
+require(ggplot2)
+require(kableExtra)
+#require(sf)
+require(tidyverse)
+#require(conflicted)
+require(readxl)
+require(modelsummary)
+#require(lubridate)
+#require(gt)
+#require(stargazer)
+require(kableExtra)
+require(cowplot)
+require(forecast)
+#require(zoo)
+require(gplots)
+require(car) 
+require(tseries)
+require(lmtest)
+#require(plm)
+require(fixest)
+#require(pROC)
+
+# Load the dataset from Excel
+dataset <- read_excel("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/PARCELLA VARIABILE/DATASET/Dataset_performance.xlsx", sheet = "Final", col_names = TRUE)
+
+# Create 'after' variable
+dataset <- dataset %>%
+  mutate(after = ifelse(date_obs > date_start_prj, 1, 0))
+
+# Create 'targ_higher' variable
+dataset <- dataset %>%
+  mutate(targ_higher = ifelse(target_achievement>1, 1, 0))
+
+# Check dataset balance
+print(table(ifelse(dataset$after==1,"After","Before"), dataset$firm_name))
+#as it is possible to see Eurostandard seem to be excessively imbalanced between before and after
+
+#Conversion of data from POSIXct to Date
+dataset<-dataset%>%
+  mutate(date_obs=as.Date(date_obs),
+         date_start_prj=as.Date(date_start_prj),
+         date_end_prj=as.Date(date_end_prj)
+         )
+
+#Computation of the length of the project
+dataset<-dataset%>%
+  mutate(diff_since_beg=date_obs-date_start_prj)
+
+```
+
+```{r,message=FALSE}
+#Computation of Descriptive Statistics
+
+#Creation of a list of statistics to be computed and of variables names
+stat_list <- c('mean', 'median', 'sd')
+var_list <- c('performance', 'target_achievement')
+
+#Creation of a dataset which grouped Descriptive statistics, Before and After
+dataset_stat <- dataset%>%
+  group_by(KPI_id, after)%>%
+  summarize(across(var_list, ~mean(.), .names ="mean_{.col}_bf"),across(var_list,~median(.), .names ="median_{.col}_bf"),across(var_list,~sd(.),.names="sd_{.col}_bf"))
+
+#Creation of a Categorical variable related to the KPI_id
+dataset_stat$KPI_id_cat<-as.numeric(factor(dataset_stat$KPI_id))
+
+table<-dataset%>%
+  group_by(KPI_id)%>%
+  summarise(count=n())
+
+table<-dataset%>%
+  group_by(KPI_area,after)%>%
+  summarize(count=n())
+
+rm(table)
+
+unweighted_mean<-dataset_stat%>%
+  filter(after==1)
+print(mean(unweighted_mean$mean_target_achievement_bf))
+print(sd(unweighted_mean$mean_target_achievement_bf))
+unweighted_mean_bef<-dataset_stat%>%
+  filter(after==0)
+print(mean(unweighted_mean_bef$mean_target_achievement_bf))
+print(sd(unweighted_mean_bef$mean_target_achievement_bf))
+#Creation of targ_0 and targ_higher to see whether the values before and after  coincides
+dataset_stat<-dataset_stat%>%
+  mutate(targ_0=ifelse(mean_target_achievement_bf>0,1,0),
+         targ_higher=ifelse(mean_target_achievement_bf>=1,1,0))
+
+#Generating a table which shows how many KPI were above 0 in TA and before the observations
+table_stat<-table(dataset_stat$after,dataset_stat$targ_0)
+row_names<-c("Below Zero","Above Zero")
+col_names<-c("Before","After")
+
+dimnames(table_stat)<-list(row_names,col_names)
+print(table_stat)
+
+#Generating a table which shows how many KPi were above the target after and before observations
+table_stat<-table(dataset_stat$after,dataset_stat$targ_higher)
+row_names<-c("Below Target","Above Target")
+col_names<-c("Before","After")
+
+dimnames(table_stat)<-list(row_names,col_names)
+print(table_stat)
+
+rm(table_stat)
+#Creation of the scatter list and scatter list log, which contains names
+sct_list<-list()
+sct_list_log<-list()
+for (st in stat_list){
+  for(var in var_list){
+    sct_log<-paste0("log_",{st},"_",{var},"_bf")
+    sct_list_log<-c(sct_list_log,sct_log)
+    sct<-paste0({st},"_",{var},"_bf")
+    sct_list<-c(sct_list,sct)
+  }
+}
+
+
+for (sct in sct_list) {
+  var_name <- as.name(sct)
+  new_col_name <- paste0("log_", sct)
+  dataset_stat <- dataset_stat %>%
+    mutate(!!new_col_name:=log(!!var_name))
+}
+
+rm(col_names,new_col_name,sct_log,st,stat_list,var_list)
+
+gph<-dataset%>%
+  ggplot()+
+  facet_wrap(~after)+
+  geom_boxplot(aes(target_achievement),outlier.shape = NA)+
+  scale_x_discrete(limits=levels(dataset$target_achievement)[-10:10])
+print(gph)
+
+```
+
+```{r,message=FALSE}
+#Creation of a unique list of KPI_id
+KPI_cat<-unique(dataset$KPI_id)
+
+#dataset<-dataset%>%
+  #mutate(KPI_cat = KPI_id[match(KPI_id, unique(KPI_id))])
+
+#Creating the retrieve function which "retrieve" the particular name or information needed from a specific dataset
+#it will be vastly used later
+retrieve<-function(data, to_pull,eqlz){
+  result<-data%>%##you could leave dataset, instead of data
+    filter(KPI_id==eqlz)%>%
+    pull(as.name(to_pull))%>%
+    unique()
+  return(result)
+}
+
+#Creation of a line graph which illustrates the performance and TA through out time
+
+for (kpi in KPI_cat){
+  mom_target<-retrieve(dataset,"target",kpi)
+  mom_firm<-retrieve(dataset, "firm_name",kpi)
+  beg_prj<-retrieve(dataset,"date_start_prj",kpi)
+  ta_hg<-retrieve(dataset,"targ_higher",kpi)
+  
+  gph<-dataset%>%
+    filter(KPI_id==kpi)%>%
+    arrange(date_obs)%>%
+    ggplot()+
+    geom_line(aes(x=date_obs,y=performance))+
+    labs(x="date observation", y="performance",title=(paste0(mom_firm,", ",as.character(kpi))))+
+    geom_hline(yintercept = mom_target, linetype = "dashed", color = "red")+
+    geom_vline(xintercept = beg_prj, linetype="dashed",color="purple")+
+    scale_color_manual(values = c("0" = "blue", "1" = "orange"), name = ta_hg)+
+    theme_classic()
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/line/",mom_firm[1],as.character(kpi),"PE.png"))
+  print(gph)
+}
+
+for (kpi in KPI_cat){
+  mom_target<-1
+  mom_firm<-retrieve(dataset, "firm_name",kpi)
+  beg_prj<-retrieve(dataset,"date_start_prj",kpi)
+  ta_hg<-retrieve(dataset,"targ_higher",kpi)
+    
+    gph<-dataset%>%
+      filter(KPI_id==kpi)%>%
+      arrange(date_obs)%>%
+      ggplot()+
+      geom_line(aes(x=date_obs,y=target_achievement))+
+      labs(x="date observation", y="Target Achievement",title=(paste0(mom_firm,", ",as.character(kpi))))+
+      geom_hline(yintercept = mom_target, linetype = "dashed", color = "red")+
+      geom_vline(xintercept = beg_prj, linetype="dashed",color="purple")+
+    scale_color_manual(values = c("0" = "blue", "1" = "orange"), name = ta_hg)+
+      theme_classic()
+    ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/line/",mom_firm,as.character(kpi),"TA.png"))
+    print(gph)
+}
+
+```
+
+```{r,message=FALSE}
+#Box-Plot
+for (kpi in KPI_cat){
+  data_loc<-dataset%>%
+    filter(KPI_id==kpi)
+  
+  mom_firm<-retrieve(data_loc, "firm_name",kpi)
+  
+  gph<-data_loc%>%
+    ggplot()+
+    geom_boxplot(aes(performance), outlier.colour = "red",outlier.fill = "red")+
+    labs(xlab="Performance",title=paste0(mom_firm," ",kpi," Perforamnce Box-Plot"))+
+    theme_classic()
+  
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/box_plot/performance/ALL/",mom_firm,"_",kpi,"box_plot.png"))
+  
+  if (!any(is.na(data_loc$after)) && is.finite(mean(data_loc$after)) && mean(data_loc$after) > 0 && mean(data_loc$after) < 1) {
+    gph<-data_loc%>%
+    ggplot()+
+    facet_wrap(~after,labeller = labeller(after = c("0" = "Before", "1" = "After")))+
+    geom_boxplot(aes(performance), outlier.colour = "red",outlier.fill = "red")+
+    labs(xlab="Performance",title=paste0(mom_firm," ",kpi," Perforamnce After& Before Box-Plot"))+
+    theme_classic()
+  
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/box_plot/performance/AB/",mom_firm,"_",kpi,"box_plot.png"))
+  }
+}
+
+dataset<-dataset%>%
+  filter(KPI_id!="C23_1596")
+
+KPI_cat<-unique(dataset$KPI_id)
+
+#It has been excluded this KPI, because it has a target of 1 and frequent value
+#are 0, 2, 3 and 3 which brings too much variability
+
+print(table(ifelse(dataset$after==1,"After","Before"), dataset$firm_name))
+
+```
+
+```{r,message=FALSE}
+#analysis for category
+type_cat<-unique(dataset$KPI_area)
+
+#descriptive statistics
+summary_stats_bytype<-dataset%>%
+  group_by(KPI_area,after)%>%
+  summarize(
+    mean_overall_TA=mean(target_achievement),
+    median_overall_TA=median(target_achievement),
+    sd_overall_TA=sd(target_achievement),
+    obs_count=n()
+)
+
+#Scatter plot of TA by categorical KPI
+for (karea in type_cat){
+  
+  gph<-dataset%>%
+    filter(KPI_area==karea)%>%
+    arrange(date_obs)%>%
+    ggplot(aes(x = date_obs, y = target_achievement, color = factor(after))) +
+    geom_point() +
+    geom_smooth(method = "lm", se = TRUE,level=0.95)+
+    labs(x="date observation", y="Target Achievement",title=(paste0(karea," Target achievement ")))+
+    theme_classic()
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/scatter_categorical/",karea,"PE.png"))
+  print(gph)
+}
+
+#counting the number of observations for each Category of KPI
+summary_stats_bytype_gen<-dataset%>%
+  group_by(KPI_area)%>%
+  summarize(
+    mean_all_TA=mean(target_achievement),
+    median_all_TA=median(target_achievement),
+    sd_all_TA=sd(target_achievement),
+    obs_count=n()
+    )
+  
+
+```
+
+```{r,message=FALSE}
+#Correlation analysis
+
+correlation_results<-list()
+
+for (kpi in KPI_cat){
+  data_loc<-dataset%>%
+    filter(kpi==KPI_id)
+  correlation_res<-cor.test(as.numeric(data_loc$diff_since_beg),data_loc$performance)
+  cat("KPI:",kpi,":\n")
+  print(correlation_res)
+  correlation_results[[kpi]]<-correlation_res
+}
+```
+
+```{r,message=FALSE}
+#KEEP THIS????
+#Pared t-test
+for (kpi in KPI_cat){
+  data_bef<-dataset%>%
+    filter(kpi==KPI_id&&after==0)
+  
+  tryCatch({
+    t_test_result <- t.test(data_bef$performance, data_aft$performance)
+    print(paste("Welch's T-test results for KPI", kpi, ":"))
+    print(t_test_result)
+  }, error = function(e) {
+    cat("Error:", e$message, "\n")
+    cat("Not enough observations for KPI", kpi, "\n")
+  })
+}
+
+```
+
+```{r,message=FALSE}
+#Computing the Z-score
+retrieve_stat<-function(data,num,name,ind){
+  res<-data%>%
+    filter(after==num,KPI_id==name)%>%
+    pull(as.name(ind))
+  return(res)
+}
+
+dataset<- dataset %>%
+  rowwise(KPI_id)%>%
+  mutate(
+    m_value = ifelse(after == 1, retrieve_stat(dataset_stat, 1, KPI_id, "mean_performance_bf"),
+                     retrieve_stat(dataset_stat, 0, KPI_id, "mean_performance_bf")),
+    sd_value = ifelse(after == 1, retrieve_stat(dataset_stat, 1, KPI_id, "sd_performance_bf"),
+                      retrieve_stat(dataset_stat, 0, KPI_id, "sd_performance_bf")),
+    z_score = (performance-m_value)/sd_value
+  )
+```
+
+```{r,message=FALSE}
+#Computing a histogram of distribution
+kpi_tracker<-list()
+for (kpi in dataset$KPI_id){
+  mom_firm<-retrieve(dataset, "firm_name",kpi)
+  
+  if (!(kpi %in% kpi_tracker)){
+    gph<-dataset%>%
+    filter(KPI_id==kpi)%>%
+    ggplot()+
+    geom_histogram(aes(x=z_score,binwidth=0.5,fill="light"))+
+    labs(x=paste0("Distribution of Z-Score for",as.character(kpi)),title=(paste0(mom_firm,", ",as.character(kpi))))
+  
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/histogram/z_score/",mom_firm,as.character(kpi),"_z_score.png"))
+  print(gph)
+  
+  kpi_tracker<-c(kpi_tracker,kpi)
+  }
+}
+
+#divergence bar graph
+kpi_tracker <- list()
+
+for (kpi in dataset$KPI_id) {
+  mom_firm <- retrieve(dataset, "firm_name", kpi)
+  
+  if (!(kpi %in% kpi_tracker)) {
+    kpi_data <- dataset %>%
+      filter(KPI_id == kpi)
+    
+    gph <- ggplot(kpi_data, aes(x = date_obs, y = z_score, fill = z_score > 0)) +
+      geom_bar(stat = "identity") +
+      geom_vline(xintercept=kpi_data$date_start_prj[1],linetype="dashed",color="purple")+
+      labs(x = "Date of Observation", y = "Z-Score", fill = "Positive Z-Score",color="Project Start")+
+      scale_color_manual(values = c("purple"), guide = guide_legend(title = "Project Start"))
+
+    ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/histogram/z_score2/", mom_firm, as.character(kpi), "_z_score.png"))
+    
+    print(gph)
+  
+    kpi_tracker <- c(kpi_tracker, kpi)
+  }
+}
+
+```
+
+```{r,message=FALSE}
+#Z-score per target achievement
+retrieve_stat2<-function(data,num,name,ind){
+  if(num==0|num==1){
+   res<-data%>%
+    filter(after==num,KPI_area==name)%>%
+    pull(as.name(ind))
+  }else{
+    res<-data%>%
+      filter(KPI_area==name)%>%
+      pull(as.name(ind))
+  }
+  return(res)
+}
+
+#computed the Z-score per area and per TA
+dataset<- dataset %>%
+  rowwise(KPI_area)%>%
+  mutate(
+    m_value_area = ifelse(after == 1, retrieve_stat2(summary_stats_bytype, 1, KPI_area, "mean_overall_TA"),
+                     retrieve_stat2(summary_stats_bytype, 0, KPI_area, "mean_overall_TA")),
+    sd_value_area = ifelse(after == 1, retrieve_stat2(summary_stats_bytype, 1, KPI_area, "sd_overall_TA"),
+                      retrieve_stat2(summary_stats_bytype, 0, KPI_area, "sd_overall_TA")),
+    z_score_area = (target_achievement-m_value_area)/sd_value_area
+  )
+
+  
+```
+
+```{r,message=FALSE}
+#In order to compute the line graph Z-score in time
+for (kpi in KPI_cat){
+  mom_firm<-retrieve(dataset, "firm_name",kpi)
+  beg_prj<-retrieve(dataset,"date_start_prj",kpi)
+  
+  gph<-dataset%>%
+    filter(KPI_id==kpi)%>%
+    arrange(date_obs)%>%
+    ggplot()+
+    geom_line(aes(x=date_obs,y=z_score))+
+    labs(x="date observation", y="Z Score",title=(paste0(mom_firm,", ",as.character(kpi))))+
+    geom_vline(xintercept = beg_prj, linetype="dashed",color="purple")+
+    theme_classic()
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/histogram/z_score/",mom_firm[1],as.character(kpi),"z_score_time.png"))
+  print(gph)
+}
+```
+
+```{r,message=FALSE}
+#summarizing the general data
+cat(mean(dataset$z_score),median(dataset$z_score),sd(dataset$z_score))
+
+#dataset that summarize the Z score by area
+data_zscore_area<-dataset%>%
+  group_by(KPI_area)%>%
+  summarize(mean_zscore_area=mean(z_score),
+         median_zscore_area=median(z_score),
+         sd_zscore_area=sd(z_score),
+         count_zscore_area=n()
+         )
+
+```
+
+```{r,message=FALSE}
+#Summary lists for LR of performance & TA
+
+KPI_id2 <- coeff_list <- coeff_date_obs <- p_value_date_obs <- R2 <- R2_adj <- AIC <- BIC <- RMSE <- list()
+list_list <- list(KPI_id2, coeff_list, coeff_date_obs, p_value_date_obs, R2, R2_adj, AIC, BIC, RMSE)
+
+parameter_names <- c("KPI_id", "coeff", "coeff_date_obs", "p_value_date_obs", "R2", "R2_adj", "AIC", "BIC", "RMSE")
+
+lr2<-function(booly,tooly){
+  for (kpi in KPI_cat) {
+    if(booly==T){
+      data_loc <- dataset %>% filter(KPI_id == kpi & after == 1)
+    }else{
+      data_loc <- dataset %>% filter(KPI_id == kpi & after == 0)
+    }
+    if(tooly==T){
+      if (sum(!is.na(data_loc$performance)) > 0) {
+        m <- lm(performance ~ date_obs, data = data_loc)
+        
+        parameters <- list(
+          KPI_id = kpi,
+          coeff = coef(m)[1],
+          coeff_date_obs = coef(m)[2],
+          p_value_date_obs = 2*pt(abs(coef(m)[2]/summary(m)$coefficients[4]),length(data_loc$date_obs),lower.tail = FALSE),
+          R2 = summary(m)$r.squared,
+          R2_adj = summary(m)$adj.r.squared,
+          AIC = AIC(m),
+          BIC = BIC(m),
+          RMSE = sqrt(mean(residuals(m)^2))
+      )
+
+    for (i in seq_along(parameter_names)) {
+      list_list[[i]] <- c(list_list[[i]], parameters[[parameter_names[i]]])
+    }
+    }
+    }else{
+      if (sum(!is.na(data_loc$target_achievement)) > 0) {
+        m <- lm(target_achievement ~ date_obs, data = data_loc)
+        
+        parameters <- list(
+          KPI_id = kpi,
+          coeff = coef(m)[1],
+          coeff_date_obs = coef(m)[2],
+          p_value_date_obs = 2*pt(abs(coef(m)[2]/summary(m)$coefficients[4]),length(data_loc$date_obs),lower.tail = FALSE),
+          R2 = summary(m)$r.squared,
+          R2_adj = summary(m)$adj.r.squared,
+          AIC = AIC(m),
+          BIC = BIC(m),
+          RMSE = sqrt(mean(residuals(m)^2))
+      )
+
+    for (i in seq_along(parameter_names)) {
+      list_list[[i]] <- c(list_list[[i]], parameters[[parameter_names[i]]])
+    }
+  }
+    }
+  }
+  return(list_list)
+}
+
+
+
+table_lr_A<-lr2(T,T)
+table_lr_B<-lr2(F,T)
+
+table_lr_A_TA<-lr2(T,F)
+table_lr_B_TA<-lr2(F,F)
+
+summary_LRA<-as.data.frame(do.call(cbind,table_lr_A))
+summary_LRB<-as.data.frame(do.call(cbind,table_lr_B))
+summary_LRA_TA<-as.data.frame(do.call(cbind,table_lr_A_TA))
+summary_LRB_TA<-as.data.frame(do.call(cbind,table_lr_B_TA))
+
+des_summary_LRA<-summary_LRA_TA%>%
+  summarize(
+    mean_pvalue=mean(as.numeric(V4)),
+    mean_R2=mean(as.numeric(V5)),
+    mean_R2adj=mean(as.numeric(V6)),
+    sd_pvalue=sd(as.numeric(V4)),
+    sd_R2=sd(as.numeric(V5)),
+    sd_R2adj=sd(as.numeric(V6))
+  )
+
+des_summary_LRB<-summary_LRB_TA%>%
+  summarize(
+    mean_pvalue=mean(as.numeric(V4)),
+    mean_R2=mean(as.numeric(V5)),
+    mean_R2adj=mean(as.numeric(V6)),
+    sd_pvalue=sd(as.numeric(V4)),
+    sd_R2=sd(as.numeric(V5)),
+    sd_R2adj=sd(as.numeric(V6))
+  )
+  
+des_summary_LRz<-summary_LRA%>%
+  mutate(LRB_coefficient=summary_LRB$V3,
+         LRB_p_value=summary$V4)
+```
+
+```{r,message=FALSE}
+#Summary regression by KPI_area
+
+KPI_id2 <- coeff_list <- coeff_date_obs <- p_value_date_obs <- R2 <- R2_adj <- AIC <- BIC <- RMSE <- list()
+list_list <- list(KPI_id2, coeff_list, coeff_date_obs, p_value_date_obs, R2, R2_adj, AIC, BIC, RMSE)
+
+parameter_names <- c("KPI_area", "coeff", "coeff_date_obs", "p_value_date_obs", "R2", "R2_adj", "AIC", "BIC", "RMSE")
+
+lr3<-function(booly){
+  for (area in type_cat) {
+    if(booly==T){
+      data_loc <- dataset %>% filter(KPI_area == area & after == 1)
+    }else{
+      data_loc <- dataset %>% filter(KPI_area == area & after == 0)
+    }
+    
+    if (sum(!is.na(data_loc$target_achievement)) > 0) {
+      m <- lm(target_achievement ~ diff_since_beg, data = data_loc)
+        
+      parameters <- list(
+        KPI_area = area,
+        coeff = coef(m)[1],
+        coeff_date_obs = coef(m)[2],
+        p_value_date_obs = 2*pt(abs(coef(m)[2]/summary(m)$coefficients[4]),length(data_loc$date_obs),lower.tail = FALSE),
+        R2 = summary(m)$r.squared,
+        R2_adj = summary(m)$adj.r.squared,
+        AIC = AIC(m),
+        BIC = BIC(m),
+        RMSE = sqrt(mean(residuals(m)^2))
+      )
+
+    for (i in seq_along(parameter_names)) {
+      list_list[[i]] <- c(list_list[[i]], parameters[[parameter_names[i]]])
+    }
+      
+    }
+  }
+  return(list_list)
+}
+
+table_lr_A_area<-lr3(T)
+table_lr_B_area<-lr3(F)
+
+summary_LRA_area<-as.data.frame(do.call(cbind,table_lr_A_area))
+summary_LRB_area<-as.data.frame(do.call(cbind,table_lr_B_area))
+```
+
+```{r,message=FALSE}
+#z-score histogram by area of KPI
+for (karea in type_cat){
+  gph<-dataset%>%
+    filter(KPI_area==karea)%>%
+    ggplot()+
+    geom_histogram(aes(x=z_score_area,binwidth=0.5,fill=as.factor(z_score_area)))+
+    stat_function(
+      fun = function(x) {
+        mean_val <- retrieve_stat2(summary_stats_bytype_gen, 3, karea, "mean_all_TA")
+        sd_val <- retrieve_stat2(summary_stats_bytype_gen, 3, karea, "sd_all_TA")
+        obs_count <- retrieve_stat2(summary_stats_bytype_gen, 3, karea, "obs_count")
+        
+        # Debugging: Print the values
+        print(c("x", "mean_val", "sd_val", "obs_count"))
+        print(c(x, mean_val, sd_val, obs_count))
+        
+        # Check if any of the values are causing issues
+        dnorm(x, mean = mean_val, sd = sd_val) * obs_count*0.4
+      },
+      color = "blue",
+      size = 1
+    ) +
+    labs(x=paste0("Distribution of Z-Score for",as.character(karea)),title=paste("Z-Score for",as.character(karea),"KPI"))+
+    theme(legend.position = "none")
+  
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/histogram/z_score_area/",karea,"_z_score.png"))
+  print(gph)
+}
+
+for (karea in type_cat){
+  gph<-dataset%>%
+    filter(KPI_area==karea)%>%
+    ggplot()+
+    facet_wrap(~after,labeller = labeller(after = c("0" = "Before", "1" = "After")))+
+    geom_histogram(aes(x=z_score_area,binwidth=0.5,fill=as.factor(z_score_area)))+
+    labs(x=paste0("Distribution of Z-Score for",as.character(karea)),title=paste("Z-Score for",as.character(karea),"KPI"))+
+    theme(legend.position = "none")
+  
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/histogram/z_score_area_bf/",karea,"_z_score.png"))
+  print(gph)
+}
+```
+
+```{r,message=FALSE}
+#description of the descriptive statistics
+summary_stats_z_score<-dataset%>%
+  group_by(KPI_id,after)%>%
+  summarize(
+    mean_z_score_PE=mean(z_score),
+    median_z_score_PE=median(z_score),
+    sd_z_score_PE=sd(z_score),
+    obs_count=n()
+)
+
+```
+
+```{r,message=FALSE}
+#LINEAR REGRESSION
+#no longer necessary, done the summary
+lr<-function(booly){
+  table_fin<-list()
+  for (kpi in KPI_cat){
+    if (booly==TRUE){
+      data_loc<-dataset%>%
+        filter(KPI_id==kpi&after==1)
+    }else{
+      data_loc<-dataset%>%
+        filter(KPI_id==kpi&after==0)
+    }
+    #check perché ci sono alcune osservazioni che non riportano valori prima che noi arrivassimo in azienda
+  if (sum(!is.na(data_loc$performance)) > 0) {
+      mom_firm <- retrieve(data_loc, "firm_name", kpi)
+      m <- lm(performance ~ date_obs, data = data_loc)
+      m1<-lm(target_achievement~ date_obs,data=data_loc)
+  }
+  if (booly==TRUE){
+    cat(msummary(m,title=paste0("LR_",mom_firm,"_",kpi,"_A")))
+    table_out<-msummary(m,title=paste0("LR_",mom_firm,"_",kpi,"_A"))
+    save_kable(table_out, file = file.path("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/LR/After/performance/",paste0("LR_", mom_firm, "_", kpi, "_A.html")))
+    table_fin<-c(table_fin,table_out)
+    
+    table_out_1<-msummary(m1,title=paste0("LR_",mom_firm,"_",kpi,"_A_TA"))
+    save_kable(table_out_1,file=file.path("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/LR/After/target_achievement/",paste0("LR_", mom_firm, "_", kpi, "_A_TA.html")))
+  }else{
+    msummary(m,title=paste0("LR_",mom_firm,"_",kpi,"_B"))
+    table_out<-m
+    save_kable(table_out, file = file.path("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/LR/Before/performance/",paste0("LR_", mom_firm, "_", kpi, "_B.html")))
+    table_fin<-c(table_fin,table_out)
+    
+    table_out_1<-msummary(m1,title=paste0("LR_",mom_firm,"_",kpi,"_B_TA"))
+    save_kable(table_out_1,file=file.path("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/LR/Before/target_achievement/",paste0("LR_", mom_firm, "_", kpi, "_B_TA.html")))
+  }
+  }
+  return(table_fin)
+}
+
+table_lr_A<-lr(TRUE)
+table_lr_B<-lr(FALSE)
+
+
+for (kpi in KPI_cat){
+  data_loc<-dataset%>%
+    filter(KPI_id==kpi)
+  tryCatch({
+    m<- lm(performance ~ date_obs, data = data_loc)
+   m1<-lm(target_achievement~ date_obs,data=data_loc)
+   print(msummary(m,title="Perf"))
+   print(msummary(m1),title="TArg")
+  },error = function(e) {
+    cat("Error:", e$message, "\n")
+    cat("Not enough observations for KPI", kpi, "\n")
+  })
+
+}
+
+```
+
+```{r,message=FALSE}
+#complete regression: performance/date_obs+after+date_obs:after
+
+for (kpi in KPI_cat){
+  data_loc<-dataset%>%
+      filter(KPI_id==kpi)
+  
+  m <- lm(performance ~ date_obs + after +date_obs:after, data = data_loc)
+  
+  #cat(msummary(m,title=paste0("LR_","_",kpi,"_Complete")))
+  table_out<-msummary(m,title=paste0("LR_",mom_firm,"_",kpi,"_Complete"))
+  save_kable(table_out, file = file.path("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/LR/Complete/performance/",paste0("LR_", kpi, "_Complete.html")))
+}
+
+
+KPI_cat <- subset(KPI_cat, KPI_cat != "C23_1596")
+
+```
+
+```{r,message=FALSE}
+KPI_id2 <- coeff_list <- coeff_date_obs <- coeff_after<- coeff_date_after <- p_value_date_obs <- p_value_after <- p_value_date_after <- R2 <- R2_adj <- AIC <- BIC <- RMSE <- list()
+
+list_list <- list(KPI_id2, coeff_list, coeff_date_obs, coeff_after, coeff_date_after, p_value_date_obs, p_value_after, p_value_date_after, R2, R2_adj, AIC, BIC, RMSE)
+
+parameter_names <- c("KPI_id", "coeff", "coeff_date_obs","coeff_after","coeff_date_after", "p_value_date_obs","p_value_after", "p_value_date_after","R2", "R2_adj", "AIC", "BIC", "RMSE")
+
+for (kpi in KPI_cat){
+  data_loc<-dataset%>%
+    filter(KPI_id==kpi)
+  
+  if (sum(!is.na(data_loc$performance)) > 0) {
+    mom_firm <- retrieve(data_loc, "firm_name", kpi)
+    m <- lm(performance ~ date_obs + after + date_obs:after, data = data_loc)
+  }
+  
+   parameters <- list(
+        KPI_id = kpi,
+        coeff = coef(m)[1],
+        coeff_date_obs = coef(m)[2],
+        coeff_after=coef(m)[3],
+        coeff_date_after=coef(m)[4],
+        p_value_date_obs = 2*pt(abs(coef(m)[2]/summary(m)$coefficients[6]),length(data_loc$date_obs)-4,lower.tail = FALSE),
+        p_value_after = 2*pt(abs(coef(m)[3]/summary(m)$coefficients[7]),length(data_loc$date_obs)-4,lower.tail = FALSE),
+        p_value_date_after = 2*pt(abs(coef(m)[4]/summary(m)$coefficients[8]),length(data_loc$date_obs)-4,lower.tail = FALSE),
+        R2 = summary(m)$r.squared,
+        R2_adj = summary(m)$adj.r.squared,
+        AIC = AIC(m),
+        BIC = BIC(m),
+        RMSE = sqrt(mean(residuals(m)^2))
+      )
+
+    for (i in seq_along(parameter_names)) {
+      list_list[[i]] <- c(list_list[[i]], parameters[[parameter_names[i]]])
+    }
+    }
+
+summary_LR_combined<-as.data.frame(do.call(cbind,list_list))
+
+tab_trial<-lm(performance ~ date_obs + after + date_obs:after, data = dataset%>%filter(KPI_id=="C23_1701"))
+print(msummary(tab_trial))
+tab_summary_trial<-summary(tab_trial)
+```
+
+```{r,message=FALSE}
+coefficients <- vector("list", length=13)
+
+for (kpi in KPI_cat) {
+  data_loc <- dataset %>%
+    filter(KPI_id == kpi)
+  
+  if (sum(!is.na(data_loc$performance)) > 0) {
+    mom_firm <- retrieve(data_loc, "firm_name", kpi)
+    m <- lm(performance ~ date_obs + after + date_obs:after, data = data_loc)
+    
+    parameters <- list(
+      KPI_id = kpi,
+      coeff = coef(m)[1],
+      coeff_date_obs = coef(m)[2],
+      coeff_after = coef(m)[3],
+      coeff_date_after = coef(m)[4],
+      p_value_date_obs = 2 * pt(abs(coef(m)[2] / summary(m)$coefficients[6]), length(data_loc$date_obs) - 4, lower.tail = FALSE),
+      p_value_after = 2 * pt(abs(coef(m)[3] / summary(m)$coefficients[7]), length(data_loc$date_obs) - 4, lower.tail = FALSE),
+      p_value_date_after = 2 * pt(abs(coef(m)[4] / summary(m)$coefficients[8]), length(data_loc$date_obs) - 4, lower.tail = FALSE),
+      R2 = summary(m)$r.squared,
+      R2_adj = summary(m)$adj.r.squared,
+      AIC = AIC(m),
+      BIC = BIC(m),
+      RMSE = sqrt(mean(residuals(m)^2))
+    )
+    
+    for (i in seq_along(parameters)) {
+      coefficients[[i]] <- c(coefficients[[i]], parameters[[i]])
+    }
+  }
+}
+
+summary_LR_combined <- as.data.frame(coefficients)
+col_names<-c("KPI_id", "coeff", "coeff_date_obs","coeff_after","coeff_date_after", "p_value_date_obs","p_value_after", "p_value_date_after","R2", "R2_adj", "AIC", "BIC", "RMSE")
+names(summary_LR_combined)<-col_names
+
+tab_trial <- lm(performance ~ date_obs + after + date_obs:after, data = dataset %>% filter(KPI_id == "C23_1701"))
+print(msummary(tab_trial))
+tab_summary_trial <- summary(tab_trial)
+```
+
+```{r,message=FALSE}
+#Graphs of Linear regressions
+
+for(kpi in KPI_cat){
+  mom_target<-retrieve(dataset,"target",kpi)
+  mom_baseline<-retrieve(dataset,"baseline",kpi)
+  mom_firm<-retrieve(dataset, "firm_name",kpi)
+  beg_prj<-retrieve(dataset,"date_start_prj",kpi)
+  ta_hg<-retrieve(dataset,"targ_higher",kpi)
+  
+  data_in_use<-dataset%>%
+    filter(KPI_id==kpi)
+  
+  gph<-data_in_use%>%
+    ggplot(aes(x = date_obs, y = performance, color = factor(after))) +
+    geom_point() +
+    geom_smooth(method = "lm", se = TRUE,level=0.95) +#0.95 confidence
+    geom_hline(aes(yintercept = mom_target, linetype = "Target"))+
+    geom_hline(aes(yintercept = mom_baseline, linetype = "Baseline"))+
+    #geom_hline(yintercept = mom_baseline, linetype = "dashed", color = "orange")+
+    geom_vline(aes(xintercept = beg_prj, linetype = "dashed", color = "purple"))+
+    labs(title = paste0(mom_firm,kpi," Effect of Consulency on Performance"), x = "Date",y = "Performance",color = "After Event") +
+     scale_linetype_manual(name = "Legenda",values = c("solid", "dashed", "dashed"),labels = c("Baseline", "Target","Commincing date")
+  )+
+    scale_color_manual(values = c("blue", "red","orange"))
+  
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/LR_AB/",mom_firm,as.character(kpi),"LR.png"))
+    #print(gph)
+  
+  gph1<-data_in_use%>%
+    ggplot(aes(x = date_obs, y = target_achievement, color = factor(after))) +
+    geom_point() +
+    geom_smooth(method = "lm", se = TRUE,level=0.95) +#0.95 confidence
+    geom_hline(aes(yintercept = 1))+
+    geom_vline(aes(xintercept = beg_prj, linetype = "dashed", color = "purple"))+
+    labs(title = paste0(mom_firm,kpi," Effect of Consulency on Performance"), x = "Date",y = "Target Achievement",color = "After Event")
+  
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/LR_AB_TA/",mom_firm,as.character(kpi),"LR_TA.png"))
+    #print(gph1)
+  
+  combined_plot <- plot_grid(gph, gph1, nrow = 1)
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/LR_AB_COMBINED/", mom_firm, as.character(kpi), "_Combined_LR.png"))
+  
+  lm_model<-lm(performance~date_obs+after+date_obs:after,data=data_in_use)
+    png(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/LR_RES/", mom_firm, as.character(kpi), "_RES_LR.png"))
+    gph2<-plot(lm_model,which=1,title(main=paste0(mom_firm," ",kpi," Residuals vs Fitted of Date, Date:After")),lwd=2)
+    dev.off()
+    print(gph2)
+  
+ #print(combined_plot)
+}
+
+```
+
+```{r,message=FALSE}
+#residual analysis results
+vars_list<-vector("list",length = 6)
+
+for (kpi in KPI_cat){
+  data_in_use<-dataset%>%
+    filter(KPI_id==kpi)
+  
+  if(0 %in% data_in_use$after & 1 %in% data_in_use){
+    
+  lm_model <- lm(performance ~ date_obs + after + date_obs:after, data = data_in_use)
+  residuals <- residuals(lm_model)
+  summary_res <- summary(residuals)
+  
+  for (i in 1:length(summary_res)){
+    vars_list[[i]] <- c(vars_list[[i]], summary_res[[i]])
+  }
+  print(summary_res)
+  }
+}
+
+column_names <- c("Min", "1st_Quartile", "Median", "Mean", "3rd_Quartile", "Max")
+
+res_summary_stat<-do.call(data.frame, vars_list)
+names(res_summary_stat)<-column_names
+```
+
+```{r,message=FALSE}
+#graph regression by area
+for(area in type_cat){
+  
+  data_in_use <- dataset %>%
+    filter(KPI_area == area)
+  
+  gph <- data_in_use %>%
+    ggplot(aes(x = diff_since_beg, y = target_achievement, color = factor(after))) +
+    geom_point() +
+    geom_hline(aes(yintercept = 1, linetype = "Target", color = "Target"), linewidth = 1) + 
+    geom_hline(aes(yintercept = 0, linetype = "Baseline", color = "Baseline"), linewidth = 1) +
+    geom_smooth(method = "lm", se = TRUE, level = 0.95,linewidth=1.25) +
+    labs(title = paste0("Effect of Consulency on TA by ", area),
+         x = "Difference since Beginning Project",
+         y = "Target Achievement",
+         color = "After Event") +
+    scale_color_manual(name="Legend", values = c("black","red", "blue", "orange"),
+                       labels = c("Target", "Baseline")) +
+    scale_linetype_manual(values = c("dashed", "solid"),
+                          labels = c("Target", "Baseline")) + 
+    theme(legend.position = "bottom")
+  
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/LR_AB_area/", area, "_LR.png"))
+  print(gph)
+}
+```
+
+```{r,message=FALSE}
+#loess graphs
+for(kpi in KPI_cat){
+  mom_target<-retrieve(dataset,"target",kpi)
+  mom_baseline<-retrieve(dataset,"baseline",kpi)
+  mom_firm<-retrieve(dataset, "firm_name",kpi)
+  beg_prj<-retrieve(dataset,"date_start_prj",kpi)
+  ta_hg<-retrieve(dataset,"targ_higher",kpi)
+  
+  data_in_use<-dataset%>%
+    filter(KPI_id==kpi)
+  
+  gph <- data_in_use %>%
+  ggplot(aes(x = date_obs, y = performance, color = factor(after))) +
+  geom_point() +
+  geom_smooth(method = "loess", se = TRUE, level = 0.95) +
+  geom_hline(aes(yintercept = mom_target, linetype = "Mom Target"), color = "red") +
+  geom_hline(aes(yintercept = mom_baseline, linetype = "Mom Baseline"), color = "orange") +
+  geom_vline(aes(xintercept = beg_prj, linetype = "Project Start"), color = "purple") +
+  labs(
+    title = paste0(mom_firm," ", kpi, " Effect of Consultancy on Performance"),
+    x = "Date",
+    y = "Performance",
+    color = "After Event"
+  ) +
+  scale_linetype_manual(
+    name = "Legend",
+    values = c("solid", "dashed", "dashed", "dashed"),
+    labels = c("Quadratic Fit", "Mom Target", "Mom Baseline", "Project Start")
+  ) +
+  scale_color_manual(
+    values = c("blue", "red", "orange", "purple")
+  )
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/QF_AB/",mom_firm,as.character(kpi),"LR.png"))
+print(gph)
+}
+```
+
+```{r,message=FALSE}
+#loess graph by AREA
+for(area in type_cat){
+  
+  data_in_use<-dataset%>%
+    filter(KPI_area==area)
+  
+  gph <- data_in_use %>%
+  ggplot(aes(x = diff_since_beg, y = target_achievement, color = factor(after))) +
+  geom_point() +
+  geom_smooth(method = "loess", se = TRUE, level = 0.95) +
+  geom_hline(aes(yintercept = 1, linetype = "Target"), color = "red") +
+  geom_hline(aes(yintercept = 0, linetype = "Baseline"), color = "orange") +
+  geom_vline(aes(xintercept = 0, linetype = "Project Start"), color = "purple") +
+  labs(
+    title = paste0("Effect of Consultancy on Performance for ", area),
+    x = "Difference since Beginning of Project",
+    y = "Target Achievement",
+    color = "After Event"
+  ) +
+  scale_linetype_manual(
+    name = "Legend",
+    values = c("solid", "dashed", "dashed", "dashed"),
+    labels = c("Quadratic Fit", "Target", "Baseline", "Project Start")
+  ) +
+  scale_color_manual(
+    values = c("blue", "red", "orange", "purple")
+  )
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/QF_AB/Area/",as.character(area),"_LR.png"))
+print(gph)
+}
+
+#loess graph by firm
+for(area in type_cat){
+  
+  data_in_use<-dataset%>%
+    filter(KPI_area==area)
+  
+  gph <- data_in_use %>%
+  ggplot(aes(x = diff_since_beg, y = target_achievement, color = factor(firm_name))) +
+  geom_point() +
+  geom_smooth(aes(group = factor(after)), method = "loess", se = TRUE, level = 0.95) +
+  geom_hline(aes(yintercept = 1, linetype = "Target"), color = "red") +
+  geom_hline(aes(yintercept = 0, linetype = "Baseline"), color = "orange") +
+  geom_vline(aes(xintercept = 0, linetype = "Project Start"), color = "purple") +
+  labs(
+    title = paste0("Effect of Consultancy on Performance for ", area),
+    x = "Difference since Beginning of Project",
+    y = "Target Achievement",
+    color = "After Event"
+  ) +
+  scale_linetype_manual(
+    name = "Legend",
+    values = c("solid", "dashed", "dashed", "dashed"),
+    labels = c("Quadratic Fit", "Target", "Baseline", "Project Start")
+  ) +
+  scale_color_manual(
+    values = c("blue", "red", "orange", "purple")
+  )
+  ggsave(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/QF_AB/Area/",as.character(area),"_NameFirm_LR.png"))
+print(gph)
+}
+
+```
+
+```{r,message=FALSE}
+#loess results, summary
+summary_results<-vector("list",length = 6)
+
+for (kpi in KPI_cat) {
+  for (var in c(0, 1)) {
+    data_in_use <- dataset %>%
+      filter(KPI_id == kpi & after == var) %>%
+      select(date_obs, performance, after) %>%
+      mutate(KPI_area = as.factor(KPI_area),
+             date_obs = as.integer(date_obs))
+    if(nrow(data_in_use)>0){
+      loess_model <- loess(performance ~ date_obs, data_in_use)
+      loess_summary <- summary(loess_model)
+      
+      #significance test
+    
+      residuals <- residuals(loess_model)
+      observed_msr <- mean(residuals^2)
+      
+      num_permutations <- 10000
+      permutation_msr <- numeric(num_permutations)
+      
+      for (i in 1:num_permutations) {
+        permuted_residuals <- sample(residuals)
+        permutation_msr[i] <- mean(permuted_residuals^2)
+      }
+      
+      p_value <- mean(permutation_msr >= observed_msr)
+      
+      tmp_summary <- c(kpi, var, mean(data_in_use$performance), mean(loess_summary$fitted), loess_summary$s,p_value)
+
+      for (i in seq_along(summary_results)) {
+        summary_results[[i]] <- c(summary_results[[i]], tmp_summary[[i]])
+      } 
+    }
+  }
+}
+
+column_names <- c("KPI id", "After", "Mean Performance", "Mean Fitted", "Standard Error","P-value")
+summary_table <- do.call(data.frame, summary_results)
+names(summary_table)<-column_names
+
+require(openxlsx)
+write.xlsx(summary_table,"C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/QR_AB/summary_table2.xlsx")
+#print(sum(is.na(dataset$date_obs))
+#print(sum(is.nan(dataset$performance)))
+#print(sum(is.nan(dataset$date_obs)))
+#print(sum(is.infinite(dataset$date_obs)))
+#print(sum(is.infinite(dataset$performance)))
+```
+
+```{r,message=FALSE}
+#loess summary results by AREA
+summary_results<-vector("list",length = 6)
+
+for (area in type_cat) {
+  for (var in c(0, 1)) {
+    data_in_use <- dataset %>%
+      filter(KPI_area == area & after == var) %>%
+      select(diff_since_beg, target_achievement, after) %>%
+      mutate(KPI_area = as.factor(KPI_area),
+             diff_since_beg = as.integer(diff_since_beg))
+    if(nrow(data_in_use)>0){
+      loess_model <- loess(target_achievement ~ diff_since_beg, data_in_use)
+      loess_summary <- summary(loess_model)
+      
+      #significance test
+    
+      residuals <- residuals(loess_model)
+      observed_msr <- mean(residuals^2)
+      
+      num_permutations <- 10000
+      permutation_msr <- numeric(num_permutations)
+      
+      for (i in 1:num_permutations) {
+        permuted_residuals <- sample(residuals)
+        permutation_msr[i] <- mean(permuted_residuals^2)
+      }
+      
+      p_value <- mean(permutation_msr >= observed_msr)
+      
+      tmp_summary <- c(area, var, mean(data_in_use$target_achievement), mean(loess_summary$fitted), loess_summary$s,p_value)
+
+      for (i in seq_along(summary_results)) {
+        summary_results[[i]] <- c(summary_results[[i]], tmp_summary[[i]])
+      } 
+    }
+  }
+}
+
+column_names <- c("Area", "After", "Mean Performance", "Mean Fitted", "Standard Error","P-value")
+summary_table_area <- do.call(data.frame, summary_results)
+names(summary_table)<-column_names
+
+require(openxlsx)
+write.xlsx(summary_table_area,"C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/QR_AB/summary_table_area.xlsx")
+```
+
+```{r,message=FALSE}
+#average coefficients
+
+lr2 <- function(booly,truly) {
+  coef_list <- list()
+  for (kpi in KPI_cat) {
+    if (booly == TRUE&truly==TRUE) {
+      data_loc <- dataset %>%
+        filter(KPI_id == kpi & after == 1&targ_higher==1)
+    } else {
+      if (booly==TRUE&truly==FALSE){
+        data_loc <- dataset %>%
+          filter(KPI_id == kpi & after == 1&targ_higher==0)
+      }else{
+        if(booly==FALSE&truly==TRUE){
+          data_loc <- dataset %>%
+            filter(KPI_id == kpi & after == 0&targ_higher==1)
+        }else{
+          data_loc <- dataset %>%
+            filter(KPI_id == kpi & after == 0&targ_higher==0)
+        }
+      }
+    }
+    # facciamo un check perché ci sono alcune osservazioni che non riportano valori prima che noi arrivassimo in azienda
+    if (sum(!is.na(data_loc$performance)) > 0) {
+      mom_firm <- retrieve(data_loc, "firm_name", kpi)
+      m <- lm(performance ~ date_obs, data = data_loc)
+      coef_list[[paste0("LR_", mom_firm, "_", kpi, "_", ifelse(booly, "A", "B"))]] <- coef(m)
+    }
+  }
+
+  if (length(coef_list) > 0) {
+    # Calculate average coefficients
+    avg_coefs <- colMeans(do.call(rbind, coef_list))
+
+    # Calculate standard deviations of coefficients
+    sd_coefs <- apply(do.call(rbind, coef_list), 2, sd)
+
+    # Save or print the results as needed
+    if (booly == TRUE&truly==TRUE) {
+      cat("Average Coefficients (After & Higher):\n")
+      print(avg_coefs)
+      cat("Standard Deviations of Coefficients (After & Higher):\n")
+      print(sd_coefs)
+    } else {
+      if(booly == TRUE&truly==FALSE){
+        cat("Average Coefficients (After & Lower):\n")
+        print(avg_coefs)
+        cat("Standard Deviations of Coefficients (After & Lower):\n")
+        print(sd_coefs)
+      }else{
+      if(booly == FALSE&truly==TRUE){
+        cat("Average Coefficients (Before & Higher):\n")
+        print(avg_coefs)
+        cat("Standard Deviations of Coefficients (Before & Higher):\n")
+        print(sd_coefs)
+      }else{
+        cat("Average Coefficients (Before & Lower):\n")
+        print(avg_coefs)
+        cat("Standard Deviations of Coefficients (Before & Lower):\n")
+        print(sd_coefs)
+      }
+    }
+  }
+  }
+}
+
+# Call the function for after consultancy
+lr2(TRUE,TRUE)
+lr2(TRUE,FALSE)
+lr2(FALSE,TRUE)
+lr2(FALSE,FALSE)
+
+```
+
+```{r,message=FALSE}
+lr<-function(booly){
+  table_fin<-list()
+  if (booly==TRUE){
+    data_loc<-dataset%>%
+      filter(after==1)
+    }else{
+      data_loc<-dataset%>%
+        filter(KPI_id==kpi&after==0)
+    }
+  if (sum(!is.na(data_loc$targ_higher)) > 0) {
+      mom_firm <- retrieve(data_loc, "firm_name", kpi)
+      m <- lm(performance ~ date_obs, data = data_loc)
+      m1<-lm(target_achievement~ date_obs,data=data_loc)
+  }
+  #mom_firm<-retrieve(data_loc, "firm_name",kpi)
+  #m<-lm(performance ~ date_obs,data=data_loc)
+  
+  if (booly==TRUE){
+    table_out<-msummary(m,title=paste0("LR_",mom_firm,"_",kpi,"_A"))
+    save_kable(table_out, file = file.path("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/LR/After/performance/",paste0("LR_", mom_firm, "_", kpi, "_A.html")))
+    table_fin<-c(table_fin,table_out)
+    
+    table_out_1<-msummary(m1,title=paste0("LR_",mom_firm,"_",kpi,"_A_TA"))
+    save_kable(table_out_1,file=file.path("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/LR/After/target_achievement/",paste0("LR_", mom_firm, "_", kpi, "_A_TA.html")))
+  }else{
+    #table_out<-msummary(m,title=paste0("LR_",mom_firm,"_",kpi,"_B"))
+    table_out<-m
+    save_kable(table_out, file = file.path("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/LR/Before/performance/",paste0("LR_", mom_firm, "_", kpi, "_B.html")))
+    table_fin<-c(table_fin,table_out)
+    
+    table_out_1<-msummary(m1,title=paste0("LR_",mom_firm,"_",kpi,"_B_TA"))
+    save_kable(table_out_1,file=file.path("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/LR/Before/target_achievement/",paste0("LR_", mom_firm, "_", kpi, "_B_TA.html")))
+  }
+  return(table_fin)
+  }
+
+table_lr_A<-lr(TRUE)
+table_lr_B<-lr(FALSE)
+```
+
+```{r,message=FALSE}
+#study of target achievement overall and graphs
+#functions to handle negative value, when you have to transform into log
+logh<-function(val){
+  if (val<0){
+    mom<-abs(val)
+    log_mom<-log(mom)
+    mom<--log_mom
+  }else{
+    mom<-log(val)
+  }
+  return(mom)
+}
+
+dataset<-dataset%>%
+  mutate(log_target_achievement=logh(target_achievement))
+
+
+summary_stats_TA<-dataset%>%
+  group_by(after)%>%
+  summarize(
+    mean_overall_TA=mean(target_achievement),
+    median_overall_TA=median(target_achievement),
+    sd_overall_TA=sd(target_achievement)
+)
+
+summary_table <- summary_stats_TA %>%
+  kable("html") %>%
+  scroll_box(width = "100%", height = "300px")%>%
+  kable_styling()
+
+save_kable(summary_table,"C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/TA_summary/summary_stat_TA.html")
+print(summary_table)
+
+gph<-dataset%>%
+  ggplot(aes(x=date_obs, y=log_target_achievement,color=factor(after)))+
+  geom_point()+
+  geom_smooth(method = "lm", se = TRUE, level = 0.95)+
+  labs(x="Date",y="Target Achievement",title="Target Achievement, After-Before")
+
+ggsave("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/scatter_summary_TA/TA_AB_summary.png")
+
+```
+
+```{r,message=FALSE}
+#categorization of the target achievement & bar graphs for target achievement and Z score
+#Creation of a predefined bins
+breakpoints<-c(-Inf,-3.5,-3,-2.5,-2,-1.5,-1,-0.5,0,0.5,1,1.5,2,2.5,3,3.5,Inf)
+dataset<-dataset%>%
+  mutate(cat_TA=cut(target_achievement,breaks = breakpoints))
+
+dataset%>%
+  ggplot()+
+  geom_bar(aes(x=cat_TA,fill=as.factor(cat_TA)))+
+  labs(x="Categories of target Achievement values",fill="Legenda Colori",title="Categories of Target Achievement")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+ggsave("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/bar_graph/bar_summary_TA/bar_summary_TA.png")
+
+dataset%>%
+  ggplot()+
+  facet_wrap(~after,labeller = labeller(after = c("0" = "Before", "1" = "After")))+
+  geom_bar(aes(x=cat_TA,fill=as.factor(cat_TA)))+
+  labs(x="Categories of Target Achievement",title="Categories of Target Achievement, After Before",fill="Legenda Colori")+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))
+  
+ggsave("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/bar_graph/bar_summary_TA/bar_summary_TA_AB.png")
+
+
+dataset%>%
+  ggplot()+
+  facet_wrap(~KPI_area)+
+  geom_bar(aes(x=cat_TA,fill=as.factor(cat_TA)))+
+  labs(x="Categories of Target Achievement",title="Categories of Target Achievement by Area",fill="Colors Legend")+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))
+  
+ggsave("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/bar_graph/bar_summary_TA/bar_summary_TA_area.png")
+
+
+breakpoints<-c(-Inf,-3.5,-3,-2.5,-2,-1.5,-1,-0.5,0,0.5,1,1.5,2,2.5,3,3.5,Inf)
+dataset<-dataset%>%
+  mutate(cat_ZS=cut(z_score,breaks = breakpoints))
+
+dataset%>%
+  ggplot()+
+  geom_bar(aes(x=cat_ZS,fill=as.factor(cat_ZS)))+
+  labs(x="Categories of Z-Score values",fill="Legenda Colori",title="Categories of Z-Score")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+ggsave("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/bar_graph/bar_summary_ZS/bar_summary_zs.png")
+
+dataset%>%
+  ggplot()+
+  facet_wrap(~after,labeller = labeller(after = c("0" = "Before", "1" = "After")))+
+  geom_bar(aes(x=cat_ZS,fill=as.factor(cat_ZS)))+
+  labs(x="Categories of Z-score values",title="Categories of Z-Score, After Before",fill="Legenda Colori")+
+  theme(axis.text.x=element_text(angle=90,hjust=1,vjust=0.5))
+ggsave("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/bar_graph/bar_summary_ZS/bar_summary_zs_ab.png")
+
+data_zscore_AB<-dataset%>%
+  group_by(after)%>%
+  summarize(mean_zs=mean(z_score),
+            median_zs=median(z_score),
+            sd_zs=sd(z_score),
+            count_zs=n())
+  
+table<-dataset%>%
+  group_by(cat_ZS,after)%>%
+  summarise(count=n())%>%
+  ungroup()
+print(table)  
+
+write.csv(table,file="C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/TA_summary/table_summary_cat_ZS_TA",row.names=TRUE)
+
+```
+
+```{r,message=FALSE}
+#time series with ARIMA
+ar_values <- c()
+variance <- c()
+log_likelihood <- c()
+AIC <- c()
+AICc <- c()
+BIC <- c()
+
+
+for (kpi in KPI_cat){
+  data_training<-dataset%>%
+  filter(KPI_id==kpi&after==0)
+  
+  data_spec<-dataset%>%
+  filter(KPI_id==kpi)
+  
+  if (length(data_training$performance)>10){
+  mom_firm<-retrieve(dataset, "firm_name",kpi)
+  beg_prj<-retrieve(dataset,"date_start_prj",kpi)
+  
+  min_date<-min(data_spec$date_obs)
+  start_year <- format(min_date, "%Y")
+  start_month <- format(min_date, "%m")
+  start_day <- format(min_date, "%d")
+  
+  time_series_data<-ts(data_training$performance,
+                       frequency=1,
+                       start=c(as.numeric(start_year),as.numeric(start_month,as.numeric(start_day))))
+  print(kpi)
+  act_summary<-acf(time_series_data)
+  pacf_summary<-pacf(time_series_data)
+  
+  png(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/time_series/ACF/", mom_firm, "_", kpi, "_acf.png"))
+    plot(act_summary, main = paste0("ACF for ", mom_firm, " ", kpi))
+    dev.off()
+    
+    png(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/time_series/PACF/", mom_firm, "_", kpi, "_pacf.png"))
+    plot(pacf_summary, main = paste0("PACF for ", mom_firm, " ", kpi))
+    dev.off()
+  
+  model <- auto.arima(time_series_data)
+  #model<-arima(time_series_data,order=c(3,1,3))
+  
+  #print(summary(model))
+  
+  if(length(model$coef)==1){
+    ar_values<-c(ar_values,NA, NA, NA, NA, model$coef[[1]])
+  }
+  else{
+    if(length(model$coef)<4){
+      for(i in 1:(length(model$coef)-1)){
+      ar_values<-c(ar_values,model$coef[[i]])
+      }
+      for(i in 1:(5-length(model$coef))){
+        ar_values<-c(ar_values,NA)
+      }
+      ar_values<-c(ar_values,model$coef[[length(model$coef[])]])
+    }else{
+      ar_values<-c(ar_values,model$coef[[1]],model$coef[[2]],model$coef[[3]],model$coef[[4]],NA)
+    }
+  }
+    
+    variance <- c(variance, model$sigma2)
+    log_likelihood <- c(log_likelihood, logLik(model))
+    AIC <- c(AIC, AIC(model))
+    BIC <- c(BIC, BIC(model))
+  #checkresiduals(auto_model)
+  
+  output_file <- paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/time_series/",mom_firm,"_",kpi,".txt")
+  sink(output_file)
+  cat(capture.output(summary(model)), "\n")
+  sink()
+  
+  forecast_values<-predict(model,n.ahead=length(data_spec$date_obs)-length(data_training$date_obs))
+  
+  actual_values <- as.numeric(time_series_data)
+  predicted_values <- as.numeric(forecast_values$pred)
+  prd_sup_se<-as.numeric(forecast_values$pred+forecast_values$se)
+  prd_inf_se<-as.numeric(forecast_values$pred-forecast_values$se)
+  time_index_predicted <- seq(length(actual_values)+1,
+                              length(actual_values) +length(predicted_values))
+  combined_values <- c(actual_values, predicted_values)
+  
+  y_range <- range(combined_values, na.rm = TRUE)
+  
+  png(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/time_series/",mom_firm,"_",kpi,"_ts.png"))
+  plot(actual_values, type = "l", col = "blue", lty = 1,
+       ylim = y_range, xlim = c(0,max(time_index_predicted)),
+       xlab="Time",main=paste0(mom_firm," ",kpi, "Time Series"),ylab="")
+  lines(time_index_predicted, predicted_values, col = "red", lty = 2)
+  lines(time_index_predicted, prd_sup_se, col = "orange", lty = 2)
+  lines(time_index_predicted, prd_inf_se, col = "orange", lty = 2)
+  legend("topright", legend = c("Actual Data", "Predicted Values","Std.Error"), col = c("blue", "red","orange"), lty = c(1,2,3))
+  
+  dev.off()
+  }
+}
+
+arima_summary <- data.frame(
+  AR = c("ar1", "ar2", "ma1","ma2","mean"),
+  Coefficient = ar_values,
+  Variance = variance,
+  Log_Likelihood = log_likelihood,
+  AIC = AIC,
+  BIC = BIC
+)
+
+```
+
+```{r,message=FALSE}
+#data series using ETS (Exponential Smoothing State Space Models
+for (kpi in KPI_cat) {
+  data_training <- dataset %>%
+    filter(KPI_id == kpi & after == 0)
+  
+  data_spec <- dataset %>%
+    filter(KPI_id == kpi)
+  
+  if (length(data_training$performance) > 10) {
+    mom_firm <- retrieve(dataset, "firm_name", kpi)
+    beg_prj <- retrieve(dataset, "date_start_prj", kpi)
+    
+    min_date <- min(data_spec$date_obs)
+    start_year <- format(min_date, "%Y")
+    start_month <- format(min_date, "%m")
+    start_day <- format(min_date, "%d")
+    
+    time_series_data <- ts(data_training$performance,
+                           frequency = 1,
+                           start = c(as.numeric(start_year), as.numeric(start_month), as.numeric(start_day)))
+    
+    #fitting the model
+
+    model_ets <- ets(time_series_data)
+    forecast_values <- forecast(model_ets, h = length(data_spec$date_obs) - length(data_training$date_obs))
+    
+    output_file <- paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/time_series_ets/", mom_firm, "_", kpi, ".txt")
+    sink(output_file)
+    cat(capture.output(summary(model_ets)), "\n")
+    sink()
+    
+    actual_values <- as.numeric(time_series_data)
+    predicted_values <- as.numeric(forecast_values$mean)
+    upper_bound <- as.numeric(forecast_values$upper[, "95%"])
+    lower_bound <- as.numeric(forecast_values$lower[, "95%"])
+    time_index_predicted <- seq(length(actual_values) + 1, length(actual_values) + length(predicted_values))
+    
+    combined_values <- c(actual_values, predicted_values)
+    y_range <- range(combined_values, na.rm = TRUE)
+    
+    png(paste0("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/graph/time_series_ets/", mom_firm, "_", kpi, "_ts.png"))
+    plot(actual_values, type = "l", col = "blue", lty = 1,
+         ylim = y_range, xlim = c(0, max(time_index_predicted)),
+         xlab = "Time", main = paste0(mom_firm, " ", kpi, " Time Series"), ylab = "")
+    lines(time_index_predicted, predicted_values, col = "red", lty = 2)
+    lines(time_index_predicted, upper_bound, col = "orange", lty = 2)
+    lines(time_index_predicted, lower_bound, col = "orange", lty = 2)
+    legend("topright", legend = c("Actual Data", "Predicted Values", "95% Confidence Interval"), col = c("blue", "red", "orange"), lty = c(1, 2, 3))
+    
+    dev.off()
+  }
+}
+
+```
+
+```{r,message=FALSE}
+#regression with fixed effects
+twfe<-feols(target_achievement ~ date_obs + date_obs:after|KPI_id + date_obs,data=dataset)
+save_kable(msummary(twfe, stars = c('*' = .1, '**' = .05, '***' = .01)),file=file.path("C:/Users/Lenovo/Documents/SCUOLA/UNI/BACHELOR/STAGE/R/R2/tables/fixed_effect/TA/FE_BA_TA.html"))
+
+```
+
+```{r,message=FALSE}
+#logistic regression
+for (kpi in KPI_cat) {
+  data <- dataset %>%
+    filter(KPI_id == kpi)
+
+  if (nrow(data) > 0) {
+    # Check if 'after' variable contains only 1 or only 0
+    if (length(unique(data$after)) == 1) {
+      cat("\nWarning: KPI id", kpi, "has only one unique value for 'after'.")
+      next  # Skip to the next iteration of the loop
+    }
+
+    logistic_model <- glm(after ~ performance + date_obs, 
+                          data = data, 
+                          family = binomial, 
+                          control = list(maxit = 100))
+    cat("\nProcessing KPI id:", kpi, "\n")
+    print(summary(logistic_model))
+    
+    predicted_probabilities <- predict(logistic_model, type = "response")
+    ggplot(result_df, aes(x = predicted_probabilities, fill = factor(after))) +
+      geom_density(alpha = 0.5) +
+      labs(title = "Probability Density Plot of Predicted Probabilities",
+       x = "Predicted Probabilities",
+       y = "Density") +
+      scale_fill_manual(values = c("blue", "red"))
+  }
+  
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
